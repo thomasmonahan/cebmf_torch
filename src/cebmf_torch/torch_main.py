@@ -237,6 +237,8 @@ class cEBMF:
             denom_l = (tau_map * mask_f) @ Fk2  # (N,)
             num_l = torch.einsum("ij,ij,j->i", self.R, tau_map, Fk)
             se_l = torch.sqrt(1.0 / denom_l.clamp_min(eps))
+        
+        se_l = torch.clamp(se_l, min=eps)  # <-- ensure strictly positive
 
         lhat = num_l / denom_l.clamp_min(eps)
 
@@ -260,6 +262,12 @@ class cEBMF:
         self.model_state_L[k] = resL.model_param
         self.L[:, k] = resL.post_mean
         self.L2[:, k] = resL.post_mean2
+
+        print(f"[update L{k}] post_mean mean={resL.post_mean.mean():.4f}, "
+            f"std={resL.post_mean.std():.4f}, "
+            f"min={resL.post_mean.min():.4f}, max={resL.post_mean.max():.4f}")
+
+
         nm_ll_L = normal_means_loglik(x=lhat, s=se_l, Et=resL.post_mean, Et2=resL.post_mean2)
         self.kl_l[k] = torch.as_tensor((-resL.loss) - nm_ll_L, device=self.device)
         self.pi0_L[k] = resL.pi0_null
@@ -279,7 +287,7 @@ class cEBMF:
             denom_f = (tau_map * mask_f).transpose(0, 1) @ Lk2
             num_f = torch.einsum("ij,ij,i->j", self.R, tau_map, Lk)
             se_f = torch.sqrt(1.0 / denom_f.clamp_min(eps))
-
+        se_f = torch.clamp(se_f, min=eps)
         fhat = num_f / denom_f.clamp_min(eps)
 
         # fit prior for F
@@ -302,6 +310,7 @@ class cEBMF:
         self.model_state_F[k] = resF.model_param
         self.F[:, k] = resF.post_mean
         self.F2[:, k] = resF.post_mean2
+        #print('post_mean:', resF.post_mean)
         nm_ll_F = normal_means_loglik(x=fhat, s=se_f, Et=resF.post_mean, Et2=resF.post_mean2)
         self.kl_f[k] = torch.as_tensor((-resF.loss) - nm_ll_F, device=self.device)
         self.pi0_F[k] = resF.pi0_null

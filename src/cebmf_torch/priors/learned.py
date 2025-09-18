@@ -60,7 +60,9 @@ class LearnedBuilder(PriorBuilder):
         return Prior(
             post_mean=obj.post_mean,
             post_mean2=obj.post_mean2,
-            loss=-float(obj.log_lik),
+            #loss=-float(obj.log_lik),
+            loss=-float(obj.loss),
+
             model_param=model_param,
             pi0_null=pi0_null,
         )

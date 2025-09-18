@@ -43,6 +43,7 @@ class MDN(nn.Module):
         pi = torch.softmax(self.pi(x), dim=1)
         mu = self.mu(x)
         log_sigma = self.log_sigma(x)
+        log_sigma = torch.clamp(log_sigma, -10, 5)
         return pi, mu, log_sigma
 
 
@@ -50,11 +51,34 @@ class MDN(nn.Module):
 # Loss function
 # -------------------------
 def mdn_loss_with_varying_noise(pi, mu, log_sigma, betahat, sebetahat):
-    sigma = torch.exp(log_sigma)
+    #sigma = torch.exp(log_sigma)
+    sigma = torch.exp(log_sigma)  # prevent too small or too large
+    #sigma = 0.01 + 0.99 * torch.sigmoid(log_sigma)
+
     total_sigma = torch.sqrt(sigma**2 + sebetahat.unsqueeze(1) ** 2)
     dist = torch.distributions.Normal(mu, total_sigma)
     log_probs = dist.log_prob(betahat.unsqueeze(1)) + torch.log(pi)
     return -torch.logsumexp(log_probs, dim=1).mean()
+
+import warnings
+
+def validate_sebetahat(sebetahat: torch.Tensor, min_val: float = 1e-8) -> torch.Tensor:
+    """Validate sebetahat:
+    - Raise error if NaNs are found
+    - Clamp zeros/negatives to min_val and warn
+    """
+    if torch.isnan(sebetahat).any():
+        raise ValueError("NaN detected in sebetahat! Please clean your input.")
+
+    if (sebetahat <= 0).any():
+        warnings.warn(
+            f"Non-positive values detected in sebetahat. "
+            f"Clamping to {min_val} to avoid numerical issues.",
+            RuntimeWarning
+        )
+        sebetahat = torch.clamp(sebetahat, min=min_val)
+
+    return sebetahat
 
 
 # -------------------------
@@ -94,7 +118,7 @@ def emdn_posterior_means(
     n_gaussians=5,
     hidden_dim=64,
     batch_size=512,
-    lr=1e-3,
+    lr=1e-4,
     model_param=None,
 ):
     # Standardize X
@@ -104,6 +128,8 @@ def emdn_posterior_means(
     X_scaled = scaler.fit_transform(X)
 
     # Dataset + DataLoader
+    sebetahat = validate_sebetahat(torch.as_tensor(sebetahat, dtype=torch.float32))
+
     dataset = DensityRegressionDataset(X_scaled, betahat, sebetahat)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -116,9 +142,11 @@ def emdn_posterior_means(
     )
     if model_param is not None:
         model.load_state_dict(model_param)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
+    rstrength = 0.0
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=rstrength)
+    print('reg strength:', rstrength)
     # Training loop
+    losses = []
     for epoch in range(n_epochs):
         model.train()
         running_loss = 0.0
@@ -127,10 +155,19 @@ def emdn_posterior_means(
             pi, mu, log_sigma = model(inputs)
             loss = mdn_loss_with_varying_noise(pi, mu, log_sigma, targets, noise_std)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            for name, param in model.named_parameters():
+            	if torch.isnan(param.grad).any():
+                    print(f"NaN gradient in {name}")
+
             optimizer.step()
             running_loss += loss.item()
         if (epoch + 1) % 10 == 0:
             print(f"[EMDN] Epoch {epoch + 1}/{n_epochs}, Loss: {running_loss / len(dataloader):.4f}")
+        losses.append(running_loss / len(dataloader))
+    import matplotlib.pyplot as plt
+    plt.plot(losses)
+    plt.show()
 
     # Prediction for all data
     model.eval()
@@ -144,7 +181,6 @@ def emdn_posterior_means(
     post_mean = torch.empty(J, dtype=torch.float32)
     post_mean2 = torch.empty(J, dtype=torch.float32)
     post_sd = torch.empty(J, dtype=torch.float32)
-
     for i in range(len(betahat)):
         data_loglik = get_data_loglik_normal_torch(
             betahat=betahat[i : (i + 1)],
