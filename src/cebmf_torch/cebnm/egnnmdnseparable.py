@@ -30,47 +30,42 @@ class DensityRegressionDataset(Dataset):
 # -------------------------
 # Mixture Density Network
 # -------------------------
-class MDN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_gaussians, n_layers=4):
-        super().__init__()
-        self.fc_in = nn.Linear(input_dim, hidden_dim)
-        self.hidden_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
-        self.pi = nn.Linear(hidden_dim, n_gaussians)
-        self.mu = nn.Linear(hidden_dim, n_gaussians)
-        self.log_sigma = nn.Linear(hidden_dim, n_gaussians)
 
-    def forward(self, x):
-        x = torch.relu(self.fc_in(x))
-        for layer in self.hidden_layers:
-            x = torch.relu(layer(x))
-        pi = torch.softmax(self.pi(x), dim=1)
-        mu = self.mu(x)
-        log_sigma = self.log_sigma(x)
-        log_sigma = torch.clamp(log_sigma, -10, 5)
-        return pi, mu, log_sigma
-    
-
-def knn_graph_torch(coords: torch.Tensor, k: int):
-    # coords: [N, 2]
+def knn_graph_torch(coords, k):
+    """
+    Build a kNN graph from coordinates tensor [N, d].
+    Returns edge_index [2, E].
+    """
     N = coords.size(0)
+    if N < 2:
+        # no edges possible
+        return torch.empty((2, 0), dtype=torch.long, device=coords.device)
+
+    k_eff = min(k, N - 1)
     dists = torch.cdist(coords, coords)  # [N, N]
-    knn_idx = dists.topk(k + 1, largest=False).indices[:, 1:]  # exclude self
-    row = torch.arange(N, device=coords.device).repeat_interleave(k)
+    knn_idx = dists.topk(k_eff + 1, largest=False).indices[:, 1:]  # exclude self
+    row = torch.arange(N, device=coords.device).repeat_interleave(k_eff)
     col = knn_idx.reshape(-1)
     edge_index = torch.stack([row, col], dim=0)
     return edge_index
 
+
 # -------------------------
 # GNN-based Mixture Density Network
 # -------------------------
-class GraphMDN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_gaussians, k=5, n_layers=2):
+class GraphMDNSEPARABLE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, n_gaussians, k=3, n_layers=2, location_dim=2, link_across=False):
         super().__init__()
         self.k = k
+        self.location_dim = location_dim
+        self.link_across = link_across
 
-        # GNN layers (using GCNConv for simplicity)
+        # Exclude (x,y,slice_id) from input features
+        feature_dim = input_dim - (location_dim + 1)
+
+        # GNN layers
         self.convs = nn.ModuleList()
-        self.convs.append(GCNConv(input_dim - 2, hidden_dim))  # features exclude x,y
+        self.convs.append(GCNConv(feature_dim, hidden_dim))
         for _ in range(n_layers - 1):
             self.convs.append(GCNConv(hidden_dim, hidden_dim))
 
@@ -80,24 +75,55 @@ class GraphMDN(nn.Module):
         self.log_sigma = nn.Linear(hidden_dim, n_gaussians)
 
     def forward(self, x):
-        # x shape: [N, input_dim], where last 2 dims = coords
-        feats, coords = x[:, :-2], x[:, -2:]
+        """
+        Args:
+            x: tensor of shape [N, input_dim], where:
+               - first (input_dim - 3) = features
+               - next 2 = (x, y)
+               - last = slice_id
+        """
+        feats = x[:, :-1-self.location_dim]       # embeddings/features
+        coords = x[:, -1-self.location_dim:-1]    # x,y
+        slice_ids = x[:, -1].long()
 
-        # Build k-NN graph based on coords
-        edge_index = knn_graph_torch(coords, k=self.k)
+        edge_indices = []
+        # Build separate kNN graphs per slice
+        for slice_id in slice_ids.unique():
+            mask = slice_ids == slice_id
+            coords_slice = coords[mask]
+            if coords_slice.size(0) > 1:  # need at least 2 nodes
+                edge_index = knn_graph_torch(coords_slice, k=self.k)
+                # remap to global indices
+                global_idx = mask.nonzero(as_tuple=False).view(-1)
+                edge_index = global_idx[edge_index]
+                edge_indices.append(edge_index)
 
-        # Run through GNN
+        # Optionally link across slices (full bipartite or simple concat)
+        if self.link_across and slice_ids.unique().numel() > 1:
+            idx_a = (slice_ids == slice_ids.unique()[0]).nonzero(as_tuple=False).view(-1)
+            idx_b = (slice_ids == slice_ids.unique()[1]).nonzero(as_tuple=False).view(-1)
+            # fully connect A <-> B
+            cross_edges = torch.cartesian_prod(idx_a, idx_b).T
+            edge_indices.append(cross_edges)
+
+        # Combine edge indices
+        if len(edge_indices) > 0:
+            edge_index = torch.cat(edge_indices, dim=1)
+        else:
+            # Fallback: no edges
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=x.device)
+
+        # Run GNN
         h = feats
         for conv in self.convs:
             h = F.relu(conv(h, edge_index))
 
-        # Predict mixture params
+        # MDN heads
         pi = torch.softmax(self.pi(h), dim=-1)
         mu = self.mu(h)
         log_sigma = torch.clamp(self.log_sigma(h), -10, 5)
 
         return pi, mu, log_sigma
-
 
 # -------------------------
 # Loss function
@@ -161,7 +187,7 @@ class EmdnPosteriorMeanNorm:
 # -------------------------
 # Main solver
 # -------------------------
-def emdn_posterior_means(
+def egnnmdnseparable_posterior_means(
     X,
     betahat,
     sebetahat,
@@ -186,7 +212,7 @@ def emdn_posterior_means(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Init model
-    model = GraphMDN(
+    model = GraphMDNSEPARABLE(
         input_dim=X_scaled.shape[1],
         hidden_dim=hidden_dim,
         n_gaussians=n_gaussians,
@@ -215,7 +241,7 @@ def emdn_posterior_means(
             optimizer.step()
             running_loss += loss.item()
         if (epoch + 1) % 10 == 0:
-            print(f"[EMDN] Epoch {epoch + 1}/{n_epochs}, Loss: {running_loss / len(dataloader):.4f}")
+            print(f"[EGNNMDNSEPARABLE] Epoch {epoch + 1}/{n_epochs}, Loss: {running_loss / len(dataloader):.4f}")
         losses.append(running_loss / len(dataloader))
     import matplotlib.pyplot as plt
     plt.plot(losses)

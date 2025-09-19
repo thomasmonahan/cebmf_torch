@@ -30,25 +30,6 @@ class DensityRegressionDataset(Dataset):
 # -------------------------
 # Mixture Density Network
 # -------------------------
-class MDN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_gaussians, n_layers=4):
-        super().__init__()
-        self.fc_in = nn.Linear(input_dim, hidden_dim)
-        self.hidden_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(n_layers)])
-        self.pi = nn.Linear(hidden_dim, n_gaussians)
-        self.mu = nn.Linear(hidden_dim, n_gaussians)
-        self.log_sigma = nn.Linear(hidden_dim, n_gaussians)
-
-    def forward(self, x):
-        x = torch.relu(self.fc_in(x))
-        for layer in self.hidden_layers:
-            x = torch.relu(layer(x))
-        pi = torch.softmax(self.pi(x), dim=1)
-        mu = self.mu(x)
-        log_sigma = self.log_sigma(x)
-        log_sigma = torch.clamp(log_sigma, -10, 5)
-        return pi, mu, log_sigma
-    
 
 def knn_graph_torch(coords: torch.Tensor, k: int):
     # coords: [N, 2]
@@ -64,13 +45,14 @@ def knn_graph_torch(coords: torch.Tensor, k: int):
 # GNN-based Mixture Density Network
 # -------------------------
 class GraphMDN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_gaussians, k=5, n_layers=2):
+    def __init__(self, input_dim, hidden_dim, n_gaussians, k=5, n_layers=2, location_dim = 2):
         super().__init__()
         self.k = k
+        self.location_dim = location_dim
 
         # GNN layers (using GCNConv for simplicity)
         self.convs = nn.ModuleList()
-        self.convs.append(GCNConv(input_dim - 2, hidden_dim))  # features exclude x,y
+        self.convs.append(GCNConv(input_dim - location_dim, hidden_dim))  # features exclude x,y
         for _ in range(n_layers - 1):
             self.convs.append(GCNConv(hidden_dim, hidden_dim))
 
@@ -81,7 +63,7 @@ class GraphMDN(nn.Module):
 
     def forward(self, x):
         # x shape: [N, input_dim], where last 2 dims = coords
-        feats, coords = x[:, :-2], x[:, -2:]
+        feats, coords = x[:, :-self.location_dim], x[:, -self.location_dim:]
 
         # Build k-NN graph based on coords
         edge_index = knn_graph_torch(coords, k=self.k)
@@ -97,7 +79,6 @@ class GraphMDN(nn.Module):
         log_sigma = torch.clamp(self.log_sigma(h), -10, 5)
 
         return pi, mu, log_sigma
-
 
 # -------------------------
 # Loss function
@@ -161,7 +142,7 @@ class EmdnPosteriorMeanNorm:
 # -------------------------
 # Main solver
 # -------------------------
-def emdn_posterior_means(
+def egnnmdn_posterior_means(
     X,
     betahat,
     sebetahat,
@@ -215,7 +196,7 @@ def emdn_posterior_means(
             optimizer.step()
             running_loss += loss.item()
         if (epoch + 1) % 10 == 0:
-            print(f"[EMDN] Epoch {epoch + 1}/{n_epochs}, Loss: {running_loss / len(dataloader):.4f}")
+            print(f"[EGNNMDN] Epoch {epoch + 1}/{n_epochs}, Loss: {running_loss / len(dataloader):.4f}")
         losses.append(running_loss / len(dataloader))
     import matplotlib.pyplot as plt
     plt.plot(losses)

@@ -8,6 +8,9 @@ from cebmf_torch.cebnm.cash_solver import cash_posterior_means
 from cebmf_torch.cebnm.cov_gb_prior import cgb_posterior_means
 from cebmf_torch.cebnm.cov_sharp_gb_prior import sharp_cgb_posterior_means
 from cebmf_torch.cebnm.emdn import emdn_posterior_means
+from cebmf_torch.cebnm.egnnmdn import egnnmdn_posterior_means
+from cebmf_torch.cebnm.egnnmdnseparable import egnnmdnseparable_posterior_means
+
 
 from .base import Prior, PriorBuilder
 
@@ -17,6 +20,8 @@ class LearnedPriorType(StrEnum):
     CGB = auto()
     CGB_SHARP = auto()
     EMDN = auto()
+    EGNNMDN = auto()
+    EGNNMDNSEPARABLE = auto()
 
 
 builder_functions: dict[LearnedPriorType, Callable] = {
@@ -24,6 +29,8 @@ builder_functions: dict[LearnedPriorType, Callable] = {
     LearnedPriorType.CGB: cgb_posterior_means,
     LearnedPriorType.CGB_SHARP: sharp_cgb_posterior_means,
     LearnedPriorType.EMDN: emdn_posterior_means,
+    LearnedPriorType.EGNNMDN: egnnmdn_posterior_means,
+    LearnedPriorType.EGNNMDNSEPARABLE: egnnmdnseparable_posterior_means
 }
 
 
@@ -53,6 +60,10 @@ class LearnedBuilder(PriorBuilder):
                 # π₀(x) from the covariate model
                 pi0_null = obj.pi
             case LearnedPriorType.EMDN:
+                pi0_null = None
+            case LearnedPriorType.EGNNMDN:
+                pi0_null = None
+            case LearnedPriorType.EGNNMDNSEPARABLE:
                 pi0_null = None
             case _:
                 raise ValueError(f"Unknown prior type: {self.type}")
